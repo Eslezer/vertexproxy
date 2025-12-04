@@ -170,12 +170,16 @@ def get_vertex_access_token(credentials_dict):
             return _token_cache["access_token"], None
 
         # Create credentials from service account info
-        # Include both cloud-platform and generative-language scopes
         scopes = [
+
             'https://www.googleapis.com/auth/cloud-platform',
+
             'https://www.googleapis.com/auth/generative-language',
+
             'https://www.googleapis.com/auth/generative-language.tuning',
+
             'https://www.googleapis.com/auth/generative-language.retriever'
+
         ]
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict,
