@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: janitor-ai-proxy
+    name: vertex-ai-proxy
     env: python
     buildCommand: pip install -r requirements.txt gunicorn
     startCommand: gunicorn --bind 0.0.0.0:$PORT main:app
