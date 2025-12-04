@@ -4,8 +4,26 @@ import requests
 import traceback
 import re
 import os
+import base64
+import hashlib
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
+
+# Google Auth for Vertex AI service account authentication
+try:
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+    GOOGLE_AUTH_AVAILABLE = True
+except ImportError:
+    GOOGLE_AUTH_AVAILABLE = False
+    print("WARNING: google-auth library not installed. Install with: pip install google-auth")
+
+# Token cache for Vertex AI authentication
+_token_cache = {
+    "access_token": None,
+    "expiry": 0,
+    "credentials_hash": None
+}
 
 # Configuration settings - can be modified or set via environment variables
 MODEL = os.getenv('MODEL', 'gemini-2.5-pro')  # or gemini-2.5-flash
@@ -82,6 +100,103 @@ When the user asks about current events, recent information, or anything that be
 
 # Simple prefill for when thinking is disabled
 SIMPLE_ASSISTANT_PROMPT = """<think> okay, let's do this </think>"""
+
+# Vertex AI Authentication Functions
+def parse_service_account_json(api_key_input):
+    """
+    Parse service account JSON from the API key field.
+    Accepts either a JSON string or already parsed dict.
+    Returns: (credentials_dict, error_message)
+    """
+    if not api_key_input:
+        return None, "No credentials provided"
+
+    # If it's already a dict, return it
+    if isinstance(api_key_input, dict):
+        if 'type' in api_key_input and api_key_input.get('type') == 'service_account':
+            return api_key_input, None
+        return None, "Invalid service account JSON: missing 'type' field or not a service_account"
+
+    # Try to parse as JSON string
+    if isinstance(api_key_input, str):
+        # Clean up the input - remove any whitespace/newlines at start/end
+        api_key_input = api_key_input.strip()
+
+        # Check if it looks like JSON
+        if api_key_input.startswith('{'):
+            try:
+                credentials_dict = json.loads(api_key_input)
+                if credentials_dict.get('type') == 'service_account':
+                    return credentials_dict, None
+                return None, "Invalid service account JSON: 'type' must be 'service_account'"
+            except json.JSONDecodeError as e:
+                return None, f"Failed to parse service account JSON: {str(e)}"
+        else:
+            return None, "Invalid credentials format. Please paste the full service account JSON content (starts with '{')"
+
+    return None, "Credentials must be a JSON string or dict"
+
+def get_credentials_hash(credentials_dict):
+    """Generate a hash of credentials for cache validation."""
+    if not credentials_dict:
+        return None
+    # Use client_email and private_key_id for hashing (unique identifiers)
+    key_data = f"{credentials_dict.get('client_email', '')}{credentials_dict.get('private_key_id', '')}"
+    return hashlib.md5(key_data.encode()).hexdigest()
+
+def get_vertex_access_token(credentials_dict):
+    """
+    Get an OAuth2 access token for Vertex AI using service account credentials.
+    Uses caching to avoid unnecessary token refreshes.
+    Returns: (access_token, error_message)
+    """
+    global _token_cache
+
+    if not GOOGLE_AUTH_AVAILABLE:
+        return None, "google-auth library not installed. Run: pip install google-auth"
+
+    if not credentials_dict:
+        return None, "No credentials provided"
+
+    try:
+        # Check if we have a valid cached token for these credentials
+        creds_hash = get_credentials_hash(credentials_dict)
+        current_time = time.time()
+
+        if (_token_cache["access_token"] and
+            _token_cache["credentials_hash"] == creds_hash and
+            _token_cache["expiry"] > current_time + 60):  # 60 second buffer
+            return _token_cache["access_token"], None
+
+        # Create credentials from service account info
+        scopes = ['https://www.googleapis.com/auth/cloud-platform']
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=scopes
+        )
+
+        # Refresh to get a valid token
+        credentials.refresh(Request())
+
+        # Cache the token
+        _token_cache = {
+            "access_token": credentials.token,
+            "expiry": credentials.expiry.timestamp() if credentials.expiry else current_time + 3600,
+            "credentials_hash": creds_hash
+        }
+
+        return credentials.token, None
+
+    except Exception as e:
+        error_msg = f"Failed to get access token: {str(e)}"
+        print(f"ERROR: {error_msg}")
+        return None, error_msg
+
+def get_project_id_from_credentials(credentials_dict):
+    """Extract project ID from service account credentials."""
+    if not credentials_dict:
+        return None
+    return credentials_dict.get('project_id')
 
 # Helper function to detect thinking mode toggle
 def detect_thinking_mode(messages):
@@ -390,8 +505,10 @@ def handle_proxy():
     if request.method == "GET":
         return jsonify({
             "status": "online",
-            "version": "2.5.0",
-            "info": "Google AI Studio Proxy with Toggle-able Thinking, Search & ThinkingBox (Render)",
+            "version": "3.0.0",
+            "info": "Vertex AI Proxy with Toggle-able Thinking, Search & ThinkingBox (Render)",
+            "api_type": "Vertex AI (Google Cloud)",
+            "auth_method": "Service Account JSON (paste full JSON content as API key)",
             "model": MODEL,
             "nsfw_enabled": ENABLE_NSFW,
             "thinking_mode": "toggle-able (use <thinking=on> or <thinking=off>, default: OFF)",
@@ -399,7 +516,8 @@ def handle_proxy():
             "thinkingbox_mode": "toggle-able (use <thinkingbox=on> to show thinking tags, default: OFF/cut off)",
             "search_mode": "toggle-able (use <search=on> or <search=off>, default: OFF)",
             "search_env_var": ENABLE_GOOGLE_SEARCH,
-            "parsing_mode": "lenient"
+            "parsing_mode": "lenient",
+            "google_auth_available": GOOGLE_AUTH_AVAILABLE
         })
 
     request_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -409,21 +527,40 @@ def handle_proxy():
         json_data = request.json or {}
         is_streaming = json_data.get('stream', False)
 
-        # Extract API key
-        api_key = None
+        # Extract service account credentials (JSON format)
+        # Users can paste the full service account JSON content in any of these locations
+        credentials_input = None
         auth_header = request.headers.get('authorization')
         if auth_header and auth_header.startswith('Bearer '):
-            api_key = auth_header.split(' ')[1]
+            credentials_input = auth_header.split(' ', 1)[1]
         elif request.headers.get('x-api-key'):
-            api_key = request.headers.get('x-api-key')
+            credentials_input = request.headers.get('x-api-key')
         elif json_data.get('api_key'):
-            api_key = json_data.get('api_key')
+            credentials_input = json_data.get('api_key')
         elif request.args.get('api_key'):
-            api_key = request.args.get('api_key')
+            credentials_input = request.args.get('api_key')
 
-        if not api_key:
-            print("Error: Google AI API key not found in request.")
-            return jsonify(create_error_response("Google AI API key required. Provide it in Authorization header (Bearer YOUR_KEY), x-api-key header, or api_key in JSON body/query params.")), 401
+        if not credentials_input:
+            print("Error: Service account credentials not found in request.")
+            return jsonify(create_error_response(
+                "Vertex AI service account credentials required. Paste the full JSON content of your service account key file in the API key field. "
+                "Get it from Google Cloud Console > IAM & Admin > Service Accounts > Keys > Add Key > Create new key (JSON)."
+            )), 401
+
+        # Parse service account JSON
+        credentials_dict, parse_error = parse_service_account_json(credentials_input)
+        if parse_error:
+            print(f"Error parsing credentials: {parse_error}")
+            return jsonify(create_error_response(f"Credentials error: {parse_error}")), 401
+
+        # Get OAuth2 access token
+        access_token, token_error = get_vertex_access_token(credentials_dict)
+        if token_error:
+            print(f"Error getting access token: {token_error}")
+            return jsonify(create_error_response(f"Authentication error: {token_error}")), 401
+
+        project_id = get_project_id_from_credentials(credentials_dict)
+        print(f"Authenticated with project: {project_id}")
 
         # Detect toggles from messages
         messages = json_data.get("messages", [])
@@ -535,17 +672,21 @@ def handle_proxy():
             print("WARNING: <search=on> detected but ENABLE_GOOGLE_SEARCH env var is False. Search not enabled.")
 
         # Determine endpoint URL based on streaming option
+        # Using Vertex AI global endpoint with OAuth2 Bearer token authentication
         endpoint = "streamGenerateContent" if is_streaming else "generateContent"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:{endpoint}?key={api_key}"
-        print(f"DEBUG: API endpoint: /v1beta/models/{selected_model}:{endpoint}")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:{endpoint}"
+        print(f"DEBUG: Vertex AI endpoint: /v1beta/models/{selected_model}:{endpoint}")
 
         if is_streaming:
             # Request Server-Sent Events for streaming
-            url += "&alt=sse"
+            url += "?alt=sse"
 
-        # Make request to Google AI
+        # Make request to Vertex AI
         try:
-            headers = {'Content-Type': 'application/json'}
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {access_token}'
+            }
             timeout_seconds = 300  # 5 minutes timeout
 
             if is_streaming:
@@ -556,7 +697,7 @@ def handle_proxy():
                     parser = StreamingParser(DISPLAY_THINKING_IN_CONSOLE, skip_parsing=use_thinkingbox)
 
                     try:
-                        print("Connecting to Google AI for streaming...")
+                        print("Connecting to Vertex AI for streaming...")
                         response = requests.post(
                             url,
                             json=google_ai_request,
@@ -564,7 +705,7 @@ def handle_proxy():
                             stream=True,
                             timeout=timeout_seconds
                         )
-                        print(f"Google AI stream response status: {response.status_code}")
+                        print(f"Vertex AI stream response status: {response.status_code}")
 
                         response.raise_for_status()
 
@@ -591,7 +732,7 @@ def handle_proxy():
                                     if 'error' in data:
                                         error_message = data['error'].get('message', 'Unknown error in stream data')
                                         print(f"Error in stream data: {error_message}")
-                                        yield create_error_stream_chunk(f"Google AI Error: {error_message}")
+                                        yield create_error_stream_chunk(f"Vertex AI Error: {error_message}")
                                         yield 'data: [DONE]\n\n'
                                         return
 
@@ -652,7 +793,7 @@ def handle_proxy():
                         # Finished streaming, check if we have sent anything
                         if not has_sent_data:
                             print("Warning: No content was sent to JanitorAI.")
-                            yield create_error_stream_chunk("No content received from Google AI. Turn off streaming mode and try again.")
+                            yield create_error_stream_chunk("No content received from Vertex AI. Turn off streaming mode and try again.")
                             yield 'data: [DONE]\n\n'
 
                     except requests.exceptions.RequestException as req_err:
@@ -683,14 +824,14 @@ def handle_proxy():
                 )
 
             else:  # Non-streaming request
-                print("Sending request to Google AI (non-streaming)...")
+                print("Sending request to Vertex AI (non-streaming)...")
                 response = requests.post(
                     url,
                     json=google_ai_request,
                     headers=headers,
                     timeout=timeout_seconds
                 )
-                print(f"Google AI non-stream response status: {response.status_code}")
+                print(f"Vertex AI non-stream response status: {response.status_code}")
 
                 # Try to parse JSON regardless of status code for error details
                 try:
@@ -701,7 +842,7 @@ def handle_proxy():
 
                 # Check for HTTP errors
                 if response.status_code != 200:
-                    error_msg = f"Google AI returned error code: {response.status_code}"
+                    error_msg = f"Vertex AI returned error code: {response.status_code}"
                     if google_response and 'error' in google_response:
                         error_detail = google_response['error'].get('message', response.text[:200])
                         error_msg = f"{error_msg} - {error_detail}"
@@ -720,7 +861,7 @@ def handle_proxy():
                 if not google_response.get('candidates') or not google_response['candidates'][0].get('content'):
                     finish_reason = google_response.get('candidates', [{}])[0].get('finishReason', 'UNKNOWN')
                     prompt_feedback = google_response.get('promptFeedback')
-                    filter_msg = "No content received from Google AI."
+                    filter_msg = "No content received from Vertex AI."
                     if finish_reason != 'STOP':
                         filter_msg += f" Finish Reason: {finish_reason}."
                     if prompt_feedback and prompt_feedback.get('blockReason'):
@@ -796,14 +937,14 @@ def handle_proxy():
                 return jsonify(janitor_response)
 
         except requests.exceptions.Timeout:
-            print(f"Error: Request to Google AI timed out after {timeout_seconds} seconds.")
-            return jsonify(create_error_response("Request to Google AI timed out.")), 200
+            print(f"Error: Request to Vertex AI timed out after {timeout_seconds} seconds.")
+            return jsonify(create_error_response("Request to Vertex AI timed out.")), 200
         except requests.exceptions.RequestException as e:
-            error_msg = f"Error connecting to Google AI: {e}"
+            error_msg = f"Error connecting to Vertex AI: {e}"
             print(error_msg)
             return jsonify(create_error_response(error_msg)), 200
         except Exception as e:
-            error_msg = f"Internal server error processing Google AI request: {e}"
+            error_msg = f"Internal server error processing Vertex AI request: {e}"
             print(error_msg)
             traceback.print_exc()
             return jsonify(create_error_response(error_msg)), 200
@@ -820,6 +961,8 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "api_type": "Vertex AI (Google Cloud)",
+        "auth_method": "Service Account JSON",
         "model_selected": MODEL,
         "nsfw_enabled": ENABLE_NSFW,
         "thinking_mode": "toggle-able (use <thinking=on> or <thinking=off>, default: OFF)",
@@ -827,15 +970,22 @@ def health_check():
         "thinkingbox_mode": "toggle-able (use <thinkingbox=on> to show thinking tags, default: OFF/cut off)",
         "search_mode": "toggle-able (use <search=on> or <search=off>, default: OFF)",
         "search_env_var": ENABLE_GOOGLE_SEARCH,
-        "parsing_mode": "lenient"
+        "parsing_mode": "lenient",
+        "google_auth_available": GOOGLE_AUTH_AVAILABLE
     })
 
 if __name__ == '__main__':
     print("\n" + "=" * 60)
-    print(" Google AI Studio-JanitorAI Proxy Server (Render)")
+    print(" Vertex AI Proxy Server (Render)")
     print(" Server will be accessible at your Render URL")
     print(" Use this URL as your OpenAI API endpoint in JanitorAI")
-    print(" Provide your Google AI Studio API key in JanitorAI")
+    print("")
+    print(" AUTHENTICATION:")
+    print(" Paste your full service account JSON in the API key field")
+    print(" Get it from: Google Cloud Console > IAM & Admin >")
+    print("   Service Accounts > Keys > Add Key > Create new key (JSON)")
+    print("")
+    print(f" Google Auth Library: {'Available' if GOOGLE_AUTH_AVAILABLE else 'NOT INSTALLED - Run: pip install google-auth'}")
     print(f" Model: {MODEL}")
     print(f" Thinking Mode: Toggle-able (use <thinking=on> or <thinking=off>)")
     print(f" Thinking Default: OFF")
