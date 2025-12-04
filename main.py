@@ -27,6 +27,7 @@ _token_cache = {
 
 # Configuration settings - can be modified or set via environment variables
 MODEL = os.getenv('MODEL', 'gemini-2.5-pro')  # or gemini-2.5-flash
+VERTEX_LOCATION = os.getenv('VERTEX_LOCATION', 'us-central1')  # Vertex AI region
 ENABLE_NSFW = os.getenv('ENABLE_NSFW', 'True').lower() == 'true'
 ENABLE_THINKING = os.getenv('ENABLE_THINKING', 'True').lower() == 'true'
 DISPLAY_THINKING_IN_CONSOLE = os.getenv('DISPLAY_THINKING_IN_CONSOLE', 'True').lower() == 'true'
@@ -511,10 +512,11 @@ def handle_proxy():
     if request.method == "GET":
         return jsonify({
             "status": "online",
-            "version": "3.0.0",
+            "version": "3.1.0",
             "info": "Vertex AI Proxy with Toggle-able Thinking, Search & ThinkingBox (Render)",
             "api_type": "Vertex AI (Google Cloud)",
             "auth_method": "Service Account JSON (paste full JSON content as API key)",
+            "vertex_location": VERTEX_LOCATION,
             "model": MODEL,
             "nsfw_enabled": ENABLE_NSFW,
             "thinking_mode": "toggle-able (use <thinking=on> or <thinking=off>, default: OFF)",
@@ -678,10 +680,10 @@ def handle_proxy():
             print("WARNING: <search=on> detected but ENABLE_GOOGLE_SEARCH env var is False. Search not enabled.")
 
         # Determine endpoint URL based on streaming option
-        # Using Vertex AI global endpoint with OAuth2 Bearer token authentication
+        # Using proper Vertex AI regional endpoint with OAuth2 Bearer token authentication
         endpoint = "streamGenerateContent" if is_streaming else "generateContent"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:{endpoint}"
-        print(f"DEBUG: Vertex AI endpoint: /v1beta/models/{selected_model}:{endpoint}")
+        url = f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{VERTEX_LOCATION}/publishers/google/models/{selected_model}:{endpoint}"
+        print(f"DEBUG: Vertex AI endpoint: {VERTEX_LOCATION}-aiplatform.googleapis.com/.../{selected_model}:{endpoint}")
 
         if is_streaming:
             # Request Server-Sent Events for streaming
@@ -969,6 +971,7 @@ def health_check():
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "api_type": "Vertex AI (Google Cloud)",
         "auth_method": "Service Account JSON",
+        "vertex_location": VERTEX_LOCATION,
         "model_selected": MODEL,
         "nsfw_enabled": ENABLE_NSFW,
         "thinking_mode": "toggle-able (use <thinking=on> or <thinking=off>, default: OFF)",
@@ -992,6 +995,7 @@ if __name__ == '__main__':
     print("   Service Accounts > Keys > Add Key > Create new key (JSON)")
     print("")
     print(f" Google Auth Library: {'Available' if GOOGLE_AUTH_AVAILABLE else 'NOT INSTALLED - Run: pip install google-auth'}")
+    print(f" Vertex AI Location: {VERTEX_LOCATION}")
     print(f" Model: {MODEL}")
     print(f" Thinking Mode: Toggle-able (use <thinking=on> or <thinking=off>)")
     print(f" Thinking Default: OFF")
