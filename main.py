@@ -27,7 +27,7 @@ _token_cache = {
 
 # Configuration settings - can be modified or set via environment variables
 MODEL = os.getenv('MODEL', 'gemini-2.5-pro')  # or gemini-2.5-flash
-VERTEX_LOCATION = os.getenv('VERTEX_LOCATION', 'us-central1')  # Vertex AI region
+VERTEX_LOCATION = os.getenv('VERTEX_LOCATION', 'global')  # Vertex AI region (global or regional like us-central1)
 ENABLE_NSFW = os.getenv('ENABLE_NSFW', 'True').lower() == 'true'
 ENABLE_THINKING = os.getenv('ENABLE_THINKING', 'True').lower() == 'true'
 DISPLAY_THINKING_IN_CONSOLE = os.getenv('DISPLAY_THINKING_IN_CONSOLE', 'True').lower() == 'true'
@@ -684,10 +684,18 @@ def handle_proxy():
             print("WARNING: <search=on> detected but ENABLE_GOOGLE_SEARCH env var is False. Search not enabled.")
 
         # Determine endpoint URL based on streaming option
-        # Using proper Vertex AI regional endpoint with OAuth2 Bearer token authentication
+        # Using proper Vertex AI endpoint with OAuth2 Bearer token authentication
         endpoint = "streamGenerateContent" if is_streaming else "generateContent"
-        url = f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{VERTEX_LOCATION}/publishers/google/models/{selected_model}:{endpoint}"
-        print(f"DEBUG: Vertex AI endpoint: {VERTEX_LOCATION}-aiplatform.googleapis.com/.../{selected_model}:{endpoint}")
+
+        # Handle global vs regional endpoints
+        if VERTEX_LOCATION == "global":
+            # Global endpoint uses different URL format
+            url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{selected_model}:{endpoint}"
+            print(f"DEBUG: Vertex AI global endpoint: aiplatform.googleapis.com/.../global/.../models/{selected_model}:{endpoint}")
+        else:
+            # Regional endpoint
+            url = f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{VERTEX_LOCATION}/publishers/google/models/{selected_model}:{endpoint}"
+            print(f"DEBUG: Vertex AI regional endpoint: {VERTEX_LOCATION}-aiplatform.googleapis.com/.../{selected_model}:{endpoint}")
 
         if is_streaming:
             # Request Server-Sent Events for streaming
