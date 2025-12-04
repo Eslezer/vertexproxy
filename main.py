@@ -27,7 +27,7 @@ _token_cache = {
 
 # Configuration settings - can be modified or set via environment variables
 MODEL = os.getenv('MODEL', 'gemini-2.5-pro')  # or gemini-2.5-flash
-VERTEX_LOCATION = os.getenv('VERTEX_LOCATION', 'us-central1')  # Vertex AI region
+VERTEX_LOCATION = os.getenv('VERTEX_LOCATION', 'global')  # Vertex AI region
 ENABLE_NSFW = os.getenv('ENABLE_NSFW', 'True').lower() == 'true'
 ENABLE_THINKING = os.getenv('ENABLE_THINKING', 'True').lower() == 'true'
 DISPLAY_THINKING_IN_CONSOLE = os.getenv('DISPLAY_THINKING_IN_CONSOLE', 'True').lower() == 'true'
